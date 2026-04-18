@@ -20,6 +20,8 @@ from statsmodels.tsa.stattools import adfuller, coint
 from statsmodels.tsa.vector_ar.vecm import coint_johansen
 from statsmodels.tools import add_constant
 from statsmodels.regression.linear_model import OLS
+from statsmodels.robust.robust_linear_model import RLM
+import statsmodels.robust.norms as sm_norms
 
 from data_manager import DataManager
 
@@ -37,6 +39,14 @@ MAX_WORKERS    = 11
 
 # Seuil de corrélation minimum pour ne pas tester des paires sans lien
 CORR_MIN       = 0.5
+
+# Solution 1 : winsorisation — seuil en σ pour les log-rendements
+WINSOR_Z       = 3.0
+
+# Solution 2 : instabilité du beta — poids max de la pénalité dans le score (0–1)
+# CV(β) calculé sur N_SUBPERIODS sous-périodes ; pénalité progressive, jamais un filtre dur
+BETA_INSTABILITY_WEIGHT = 0.3
+N_SUBPERIODS   = 3
 
 
 
@@ -106,6 +116,45 @@ def run_adf(series: pd.Series, name: str, fast: bool = False) -> dict:
         "critical_values": result[4],
         "is_stationary": result[1] < 0.05,
     }
+
+
+def winsorize_series(series: pd.Series, z_thresh: float = 3.0) -> pd.Series:
+    """
+    Winsorise les log-rendements à ±z_thresh σ puis reconstruit le niveau.
+    Réduit l'impact des flash-crashes et pics extrêmes sans supprimer d'observations.
+    """
+    log_prices = np.log(series)
+    log_ret = log_prices.diff()          # premier élément = NaN
+    mu    = log_ret.mean()               # skipna par défaut
+    sigma = log_ret.std()
+    log_ret_clipped = log_ret.clip(lower=mu - z_thresh * sigma,
+                                   upper=mu + z_thresh * sigma)
+    log_ret_clipped.iloc[0] = 0.0       # premier point : pas de changement
+    log_level = log_prices.iloc[0] + log_ret_clipped.cumsum()
+    return np.exp(log_level)
+
+
+def compute_beta_stability(log_y: pd.Series, log_x: pd.Series,
+                           n_periods: int = 3) -> float:
+    """
+    Découpe la série en n_periods sous-périodes et estime β sur chacune.
+    Retourne le coefficient de variation CV = std(β) / |mean(β)|.
+      CV ≈ 0  →  β stable dans le temps  (bonne paire)
+      CV ≫ 1  →  β change de régime      (paire suspecte)
+    Jamais utilisé comme filtre dur : sert de pénalité dans score_result().
+    """
+    n    = len(log_y)
+    size = n // n_periods
+    betas = []
+    for i in range(n_periods):
+        start = i * size
+        end   = start + size if i < n_periods - 1 else n
+        y_sub, x_sub = log_y.iloc[start:end], log_x.iloc[start:end]
+        beta_sub, _, _ = compute_hedge_ratio(y_sub, x_sub)
+        betas.append(beta_sub)
+    betas    = np.array(betas)
+    mean_abs = np.abs(np.mean(betas))
+    return 0.0 if mean_abs < 1e-8 else float(np.std(betas) / mean_abs)
 
 
 def compute_hedge_ratio(y: pd.Series, x: pd.Series):
@@ -344,8 +393,17 @@ def plot_results(btc, eth, spread, adf_btc, adf_eth, adf_spread,
 
 
 def score_result(result: dict) -> float:
-    """Score de scan rapide (EG + ADF spread). Plus bas = mieux."""
-    return 0.6 * result["eg"]["pvalue"] + 0.4 * result["adf_spread"]["pvalue"]
+    """
+    Score composite — plus bas = mieux.
+      base    : 0.6 × EG_p + 0.4 × ADF_spread_p   (∈ [0, 1])
+      pénalité: BETA_INSTABILITY_WEIGHT × min(CV_β / 2, 1)
+                CV_β = 0 → +0   |   CV_β = 1 → +weight/2   |   CV_β ≥ 2 → +weight
+    La pénalité dégrade le rang des paires instables sans les éliminer.
+    """
+    base    = 0.6 * result["eg"]["pvalue"] + 0.4 * result["adf_spread"]["pvalue"]
+    beta_cv = result.get("beta_cv", 0.0)
+    penalty = BETA_INSTABILITY_WEIGHT * min(beta_cv / 2.0, 1.0)
+    return base + penalty
 
 
 def is_significant(result: dict) -> bool:
@@ -378,6 +436,10 @@ def _fast_scan_pair(
         if corr < CORR_MIN:
             raise ValueError(f"Corrélation trop faible ({corr:.2f} < {CORR_MIN})")
 
+        # ── Solution 1 : winsorisation des log-rendements ─────────────────────
+        s1 = winsorize_series(s1, WINSOR_Z)
+        s2 = winsorize_series(s2, WINSOR_Z)
+
         log_s1 = np.log(s1)
         log_s2 = np.log(s2)
 
@@ -386,6 +448,9 @@ def _fast_scan_pair(
         adf_s2 = run_adf(log_s2, f"log({symbol_2})", fast=True)
 
         beta, alpha, spread = compute_hedge_ratio(log_s1, log_s2)
+
+        # ── Solution 2 : stabilité du beta (rupture structurelle légère) ─────
+        beta_cv = compute_beta_stability(log_s1, log_s2, N_SUBPERIODS)
 
         # ADF lag fixe sur le spread
         adf_spread = run_adf(spread, "Spread", fast=True)
@@ -398,7 +463,7 @@ def _fast_scan_pair(
             "n_obs": len(s1), "corr": corr,
             "s1": s1, "s2": s2, "spread": spread,
             "adf_s1": adf_s1, "adf_s2": adf_s2, "adf_spread": adf_spread,
-            "eg": eg, "beta": beta, "alpha": alpha,
+            "eg": eg, "beta": beta, "alpha": alpha, "beta_cv": beta_cv,
             "error": None,
         }
     except Exception as exc:
@@ -420,10 +485,20 @@ def _full_analysis_pair(r: dict) -> dict:
     rolling_metrics = run_rolling_cointegration(log_s1, log_s2, ROLLING_WINDOW)
     rolling_latest  = rolling_metrics.iloc[-1]
 
-    # ADF précis (autolag AIC) pour les graphiques finaux
+    # Hedge ratio robuste (Huber M-estimator) pour les graphiques finaux
+    beta_rlm, alpha_rlm, spread_rlm = (
+        RLM(log_s1, add_constant(log_s2), M=sm_norms.HuberT())
+        .fit()
+        .params.pipe(lambda p: (p.iloc[1], p.iloc[0], log_s1 - (p.iloc[0] + p.iloc[1] * log_s2)))
+    )
+    r["beta"]   = beta_rlm
+    r["alpha"]  = alpha_rlm
+    r["spread"] = spread_rlm
+
+    # ADF précis (autolag AIC) sur le spread robuste
     r["adf_s1"]     = run_adf(log_s1, f"log({r['symbol_1']})")
     r["adf_s2"]     = run_adf(log_s2, f"log({r['symbol_2']})")
-    r["adf_spread"] = run_adf(r["spread"], "Spread (résidus OLS)")
+    r["adf_spread"] = run_adf(spread_rlm, "Spread (résidus RLM)")
 
     r.update({
         "johansen":        johansen,
@@ -577,10 +652,13 @@ def run_matrix_scan():
     print(f"\n  Top {TOP_K_RESULTS} paires (scan rapide) :\n")
     for i, r in enumerate(top_k, start=1):
         flag = "✅" if r["significant"] else "⚠️ "
+        beta_cv  = r.get("beta_cv", 0.0)
+        stab_flag = "⚠️ " if beta_cv > 1.0 else "  "
         print(
             f"  {i:>2}. {flag} {r['symbol_1']:12s} / {r['symbol_2']:12s} | "
             f"score={r['score']:.4f} | EG={r['eg']['pvalue']:.4f} | "
-            f"ADF_sprd={r['adf_spread']['pvalue']:.4f} | corr={r['corr']:.2f}"
+            f"ADF_sprd={r['adf_spread']['pvalue']:.4f} | corr={r['corr']:.2f} | "
+            f"β_cv={beta_cv:.2f}{stab_flag}"
         )
 
     # ── Phase 3 : analyse complète du top K (rolling + Johansen) ─────────────
