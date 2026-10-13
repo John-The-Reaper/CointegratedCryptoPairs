@@ -25,6 +25,15 @@ import statsmodels.robust.norms as sm_norms
 
 from data_manager import DataManager
 
+try:
+    from cointegration_rust import pct_change_corr as rust_pct_change_corr
+    from cointegration_rust import winsorize_prices as rust_winsorize_prices
+    RUST_ACCEL_ENABLED = True
+except Exception:
+    RUST_ACCEL_ENABLED = False
+    rust_pct_change_corr = None
+    rust_winsorize_prices = None
+
 
 # ── Configuration ────────────────────────────────────────────────────────────
 TIMEFRAME      = "1h"
@@ -123,6 +132,14 @@ def winsorize_series(series: pd.Series, z_thresh: float = 3.0) -> pd.Series:
     Winsorise les log-rendements à ±z_thresh σ puis reconstruit le niveau.
     Réduit l'impact des flash-crashes et pics extrêmes sans supprimer d'observations.
     """
+    if RUST_ACCEL_ENABLED and rust_winsorize_prices is not None:
+        try:
+            values = series.to_numpy(dtype=np.float64, copy=False)
+            winsorized = rust_winsorize_prices(values, float(z_thresh))
+            return pd.Series(winsorized, index=series.index, name=series.name)
+        except Exception:
+            pass
+
     log_prices = np.log(series)
     log_ret = log_prices.diff()          # premier élément = NaN
     mu    = log_ret.mean()               # skipna par défaut
@@ -132,6 +149,21 @@ def winsorize_series(series: pd.Series, z_thresh: float = 3.0) -> pd.Series:
     log_ret_clipped.iloc[0] = 0.0       # premier point : pas de changement
     log_level = log_prices.iloc[0] + log_ret_clipped.cumsum()
     return np.exp(log_level)
+
+
+def compute_pct_change_corr(s1: pd.Series, s2: pd.Series) -> float:
+    if RUST_ACCEL_ENABLED and rust_pct_change_corr is not None:
+        try:
+            return float(
+                rust_pct_change_corr(
+                    s1.to_numpy(dtype=np.float64, copy=False),
+                    s2.to_numpy(dtype=np.float64, copy=False),
+                )
+            )
+        except Exception:
+            pass
+
+    return float(np.corrcoef(s1.pct_change().dropna(), s2.pct_change().dropna())[0, 1])
 
 
 def compute_beta_stability(log_y: pd.Series, log_x: pd.Series,
@@ -432,7 +464,7 @@ def _fast_scan_pair(
             raise ValueError(f"Observations insuffisantes : {len(s1)} < {ROLLING_WINDOW}")
 
         # ── Filtre corrélation (numpy pur, gratuit) ───────────────────────────
-        corr = np.corrcoef(s1.pct_change().dropna(), s2.pct_change().dropna())[0, 1]
+        corr = compute_pct_change_corr(s1, s2)
         if corr < CORR_MIN:
             raise ValueError(f"Corrélation trop faible ({corr:.2f} < {CORR_MIN})")
 
