@@ -1,2 +1,4 @@
 data
 rust/target
+__pycache__/
+*.pyc
