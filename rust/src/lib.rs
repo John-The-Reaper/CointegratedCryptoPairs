@@ -74,7 +74,7 @@ fn winsorize_prices<'py>(
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let data = prices.as_slice()?;
     if data.is_empty() {
-        return Ok(Vec::<f64>::new().into_pyarray_bound(py));
+        return Ok(Vec::<f64>::new().into_pyarray(py));
     }
 
     for &v in data {
@@ -132,7 +132,7 @@ fn winsorize_prices<'py>(
         out.push(level.exp());
     }
 
-    Ok(out.into_pyarray_bound(py))
+    Ok(out.into_pyarray(py))
 }
 
 #[pymodule]
